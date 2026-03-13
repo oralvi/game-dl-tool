@@ -1,0 +1,20 @@
+# Build outputs
+*.exe
+*.zip
+bin/
+releases/
+
+# Runtime/generated files
+cache/
+results/
+targets/
+research/
+config.json
+scan_cache.json
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
+.vscode/
+*.bak
+*.log
