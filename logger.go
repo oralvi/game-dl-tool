@@ -11,12 +11,17 @@ import (
 type runLogger struct {
 	mu   sync.Mutex
 	file *os.File
+	hook func(string)
 }
 
 func newRunLogger(path string) (*runLogger, error) {
+	return newRunLoggerWithHook(path, nil)
+}
+
+func newRunLoggerWithHook(path string, hook func(string)) (*runLogger, error) {
 	path = filepath.Clean(path)
 	if path == "" || path == "." {
-		return &runLogger{}, nil
+		return &runLogger{hook: hook}, nil
 	}
 
 	dir := filepath.Dir(path)
@@ -30,15 +35,22 @@ func newRunLogger(path string) (*runLogger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open log file %s: %w", path, err)
 	}
-	return &runLogger{file: file}, nil
+	return &runLogger{file: file, hook: hook}, nil
 }
 
 func (l *runLogger) Printf(format string, args ...any) {
-	if l == nil || l.file == nil {
+	if l == nil {
 		return
 	}
 
 	line := fmt.Sprintf(format, args...)
+	if l.hook != nil {
+		l.hook(line)
+	}
+
+	if l.file == nil {
+		return
+	}
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 
 	l.mu.Lock()

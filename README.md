@@ -1,16 +1,8 @@
 # game-dl-tool
 
-Interactive Go CLI for scanning game CDN domains, comparing IPv4 and IPv6 candidates, and optionally appending tagged entries to `hosts`.
+Desktop-first Fyne app for scanning CN game CDN domains, comparing IPv4 and IPv6 candidates, and optionally writing tagged `hosts` entries.
 
-Built-in game menu:
-
-1. `原神`
-2. `星铁`
-3. `崩坏3`
-4. `绝区零`
-5. `鸣潮国服`
-
-Built-in domains include:
+Built-in targets:
 
 - `autopatchcn.yuanshen.com`
 - `autopatchcn.bhsr.com`
@@ -23,24 +15,32 @@ Built-in domains include:
 
 What it does:
 
-- prompts for game selection when you run it without domains
+- launches a desktop GUI by default
+- keeps a CLI fallback with `-cli`
 - supports `-family 4`, `-family 6`, and `-family all`
 - samples multiple DNS resolvers and unions the answers
 - follows `CNAME` chains to final `A` or `AAAA` answers
-- measures TCP latency, default port `443`
-- can run `tracert` or `traceroute` when `-trace` is enabled
-- can load custom domains and defaults from `config.json`
+- measures TCP latency on port `443` by default
+- can run `tracert` or `traceroute` when trace is enabled
+- auto-creates `config.json` when it does not exist
 - saves scan cache to `scan_cache.json`
-- can load cached results with `-use-cache`
-- shows numbered best candidates and can append selected tagged hosts entries like `#DLTOOL`
-- shows a live progress bar while a scan is running
-- writes a run log to `cache/latest_scan.log` by default
+- can load cached results instead of running a live scan
+- writes tagged `#DLTOOL` hosts entries without touching unrelated lines
+- streams progress and log output during long scans
 
 Quick start:
 
 ```powershell
 cd d:\projects\reverse-analysis-workspace\projects\game-dl-tool
 go run .
+```
+
+CLI fallback:
+
+```powershell
+go run . -cli -games 12 -family all -csv result.csv
+go run . -cli -games 1 -family 6 -hosts-out system
+go run . -cli -input .\domains.txt -family all -use-cache
 ```
 
 Config example:
@@ -58,18 +58,16 @@ Config example:
     "pcdownload-qcloud.aki-game.com"
   ],
   "family": "6",
-  "trace": false
+  "trace": false,
+  "use_cache": false
 }
 ```
 
-Non-interactive examples:
+Windows build notes:
 
-```powershell
-go run . -games 12 -family all -csv result.csv
-go run . -games 1 -family 6 -hosts-out system
-go run . -config .\config.json
-go run . -input .\domains.txt -family all -use-cache
-```
+- Fyne on Windows needs `CGO_ENABLED=1`
+- install MSYS2 UCRT64 gcc and add `C:\msys64\ucrt64\bin` to `PATH`
+- the packaging script checks for `gcc` before building
 
 Packaging:
 
@@ -79,13 +77,7 @@ Packaging:
 
 Notes:
 
-- Running without domains uses the interactive menu. Press Enter to accept defaults.
-- If `config.json` does not exist, the program will auto-create one with your default CN domains and `family: "6"`.
-- If `config.json` exists and contains `domains` or default options, it will be applied before the interactive menu.
-- Trace probing is disabled by default to keep scans responsive. In interactive mode you can enable it when prompted, or use `-trace`.
-- After the result table is printed, you can choose candidate IDs to append to the system `hosts`; press Enter to skip.
-- Cached results are saved automatically after a live scan.
-- Hosts updates only replace tagged `#DLTOOL` lines for the hostnames selected in the current write; other lines are left untouched.
-- For Genshin hosts updates, the best result for `autopatchcn.yuanshen.com` is also written to:
-  - `autopatchhk.yuanshen.com`
-  - `genshinimpact.mihoyo.com`
+- Running with no arguments launches the GUI.
+- If `config.json` does not exist, the program creates one with the default CN domains.
+- Trace probing is off by default to keep scans responsive.
+- For Genshin hosts updates, the best result for `autopatchcn.yuanshen.com` is also written to `autopatchhk.yuanshen.com` and `genshinimpact.mihoyo.com`.

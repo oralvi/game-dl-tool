@@ -3,6 +3,8 @@
 *.zip
 bin/
 releases/
+fyne_metadata.json
+*.syso
 
 # Runtime/generated files
 cache/

@@ -73,6 +73,7 @@ type config struct {
 	Workers        int
 	ShowProgress   bool
 	Logger         *runLogger
+	ProgressSink   func(progressSnapshot)
 	Interactive    bool
 	ManualInput    bool
 	GamesWasSet    bool
@@ -121,7 +122,7 @@ type probeBatch struct {
 	Rows   []resultRow
 }
 
-func main() {
+func runCLI() {
 	cfg, inputFile, csvFile, cliDomains := parseFlags()
 	reader := bufio.NewReader(os.Stdin)
 	logger, err := newRunLogger(cfg.LogFile)
@@ -150,56 +151,26 @@ func main() {
 	}
 	cfg.Logger.Printf("selected domains: %s", strings.Join(domains, ", "))
 
-	var rows []resultRow
-	if cfg.UseCache {
-		cachedRows, err := readCache(cfg.CacheFile)
-		if err != nil {
-			exitWithError(err.Error())
-		}
-		rows = filterCachedRows(cachedRows, domains, cfg.Family)
-		if len(rows) > 0 {
-			fmt.Printf("\nUsing cached results from %s\n", cfg.CacheFile)
-			cfg.Logger.Printf("using cached results from %s", cfg.CacheFile)
-		} else {
-			fmt.Printf("\nCache %s had no matching rows, running a live scan instead.\n", cfg.CacheFile)
-			cfg.Logger.Printf("cache %s had no matching rows; falling back to live scan", cfg.CacheFile)
-		}
+	fmt.Printf(
+		"\nStarting scan for %d domains with %d resolvers. Trace: %t. Log: %s\n",
+		len(domains),
+		len(cfg.ResolverSpecs),
+		cfg.TraceEnabled,
+		cfg.LogFile,
+	)
+
+	rows, usedCache, err := executeScan(cfg, domains)
+	if err != nil {
+		exitWithError(err.Error())
 	}
-
-	if len(rows) == 0 {
-		resolvers, err := newResolverClients(cfg.ResolverSpecs)
-		if err != nil {
-			exitWithError(err.Error())
-		}
-
-		fmt.Printf(
-			"\nStarting live scan for %d domains with %d resolvers. Trace: %t. Log: %s\n",
-			len(domains),
-			len(cfg.ResolverSpecs),
-			cfg.TraceEnabled,
-			cfg.LogFile,
-		)
-		cfg.Logger.Printf(
-			"live scan started: domains=%d resolvers=%d family=%s trace=%t progress=%t",
-			len(domains),
-			len(cfg.ResolverSpecs),
-			cfg.Family,
-			cfg.TraceEnabled,
-			cfg.ShowProgress,
-		)
-
-		rows = run(cfg, resolvers, domains)
-		if err := writeCache(cfg.CacheFile, rows); err != nil {
-			exitWithError(err.Error())
-		}
+	if usedCache {
+		fmt.Printf("\nUsing cached results from %s\n", cfg.CacheFile)
+	} else {
 		fmt.Printf("\nCache saved to %s\n", cfg.CacheFile)
-		cfg.Logger.Printf("cache saved to %s", cfg.CacheFile)
 	}
 
-	sortRows(rows)
 	printTable(rows)
 	printBestByDomain(rows)
-	cfg.Logger.Printf("scan completed with %d result rows", len(rows))
 
 	rowsForHosts := bestRowsByDomainAndFamily(rows)
 	if cfg.HostsOut == "" && cfg.Interactive && !cfg.HostsOutWasSet && !cfg.ManualInput && !cfg.GamesWasSet {
@@ -543,7 +514,7 @@ func normalizeDNSAddress(server string) (string, error) {
 func run(cfg config, resolvers []resolverClient, domains []string) []resultRow {
 	jobs := make(chan string)
 	results := make(chan probeBatch)
-	progress := newProgressTracker(len(domains), cfg.ShowProgress)
+	progress := newProgressTracker(len(domains), cfg.ShowProgress, cfg.ProgressSink)
 	defer progress.stop()
 
 	var wg sync.WaitGroup

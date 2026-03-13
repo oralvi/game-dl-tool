@@ -11,12 +11,23 @@ import (
 
 var spinnerFrames = []rune{'|', '/', '-', '\\'}
 
+type progressSnapshot struct {
+	Total         int
+	Completed     int
+	ActiveCount   int
+	ActiveSummary string
+	LastCompleted string
+	Elapsed       time.Duration
+	Final         bool
+}
+
 type progressTracker struct {
-	enabled bool
-	total   int
-	started time.Time
-	stopCh  chan struct{}
-	doneCh  chan struct{}
+	terminal bool
+	total    int
+	started  time.Time
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	onUpdate func(progressSnapshot)
 
 	mu            sync.Mutex
 	completed     int
@@ -26,14 +37,15 @@ type progressTracker struct {
 	lastLineWidth int
 }
 
-func newProgressTracker(total int, enabled bool) *progressTracker {
+func newProgressTracker(total int, terminal bool, onUpdate func(progressSnapshot)) *progressTracker {
 	tracker := &progressTracker{
-		enabled:       enabled && total > 0,
+		terminal:      terminal && total > 0,
 		total:         total,
 		started:       time.Now(),
 		activeDomains: make(map[string]time.Time),
+		onUpdate:      onUpdate,
 	}
-	if !tracker.enabled {
+	if !tracker.enabled() {
 		return tracker
 	}
 
@@ -62,7 +74,7 @@ func (p *progressTracker) loop() {
 }
 
 func (p *progressTracker) startDomain(domain string) {
-	if !p.enabled {
+	if !p.enabled() {
 		return
 	}
 
@@ -72,7 +84,7 @@ func (p *progressTracker) startDomain(domain string) {
 }
 
 func (p *progressTracker) finishDomain(domain string) {
-	if !p.enabled {
+	if !p.enabled() {
 		return
 	}
 
@@ -84,7 +96,7 @@ func (p *progressTracker) finishDomain(domain string) {
 }
 
 func (p *progressTracker) stop() {
-	if !p.enabled {
+	if !p.enabled() {
 		return
 	}
 	close(p.stopCh)
@@ -92,25 +104,27 @@ func (p *progressTracker) stop() {
 }
 
 func (p *progressTracker) render() {
-	if !p.enabled {
+	if !p.enabled() {
 		return
 	}
 
 	p.mu.Lock()
 	line := p.buildLineLocked(false)
+	snapshot := p.snapshotLocked(false)
 	p.mu.Unlock()
-	p.writeLine(line)
+	p.publish(line, snapshot)
 }
 
 func (p *progressTracker) renderFinal() {
-	if !p.enabled {
+	if !p.enabled() {
 		return
 	}
 
 	p.mu.Lock()
 	line := p.buildLineLocked(true)
+	snapshot := p.snapshotLocked(true)
 	p.mu.Unlock()
-	p.writeLine(line)
+	p.publish(line, snapshot)
 }
 
 func (p *progressTracker) buildLineLocked(final bool) string {
@@ -149,6 +163,31 @@ func (p *progressTracker) writeLine(line string) {
 	}
 	fmt.Fprintf(os.Stdout, "\r%s%s", line, padding)
 	p.lastLineWidth = len(line)
+}
+
+func (p *progressTracker) enabled() bool {
+	return p.total > 0 && (p.terminal || p.onUpdate != nil)
+}
+
+func (p *progressTracker) publish(line string, snapshot progressSnapshot) {
+	if p.onUpdate != nil {
+		p.onUpdate(snapshot)
+	}
+	if p.terminal {
+		p.writeLine(line)
+	}
+}
+
+func (p *progressTracker) snapshotLocked(final bool) progressSnapshot {
+	return progressSnapshot{
+		Total:         p.total,
+		Completed:     p.completed,
+		ActiveCount:   len(p.activeDomains),
+		ActiveSummary: summarizeActiveDomains(p.activeDomains, 2),
+		LastCompleted: p.lastCompleted,
+		Elapsed:       time.Since(p.started),
+		Final:         final,
+	}
 }
 
 func buildProgressBar(done int, total int, width int) string {

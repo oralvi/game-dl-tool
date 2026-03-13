@@ -7,6 +7,11 @@ $packageName = "game-dl-tool-windows-amd64-$timestamp"
 $packageDir = Join-Path $releaseRoot $packageName
 $zipPath = Join-Path $releaseRoot "$packageName.zip"
 
+$env:CGO_ENABLED = "1"
+if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+    throw "gcc was not found in PATH. Install MSYS2 UCRT64 and add C:\\msys64\\ucrt64\\bin to PATH before packaging."
+}
+
 New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
 if (Test-Path -LiteralPath $packageDir) {
     Remove-Item -LiteralPath $packageDir -Recurse -Force
