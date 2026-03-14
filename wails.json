@@ -1,0 +1,13 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "game-dl-tool",
+  "outputfilename": "game-dl-tool.exe",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Oralvi Sakura",
+    "email": "23415066+oralvi@users.noreply.github.com"
+  }
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,35 +11,93 @@ import (
 )
 
 type fileConfig struct {
-	Domains  []string `json:"domains"`
-	Games    string   `json:"games"`
-	Family   string   `json:"family"`
-	Trace    *bool    `json:"trace"`
-	UseCache *bool    `json:"use_cache"`
-	HostsOut string   `json:"hosts_out"`
+	Games               []fileGame      `json:"games"`
+	Resolvers           []string        `json:"resolvers,omitempty"`
+	LegacyDomains       []string        `json:"domains,omitempty"`
+	LegacyGameSelection string          `json:"-"`
+	Family              string          `json:"family"`
+	GeoIP               fileGeoIPConfig `json:"geoip,omitempty"`
+	TunnelPort          int             `json:"tunnel_port,omitempty"`
 }
 
-func defaultFileConfig() fileConfig {
-	traceDisabled := false
-	useCacheDisabled := false
-	return fileConfig{
-		Domains: []string{
-			"autopatchcn.bh3.com",
-			"autopatchcn.bhsr.com",
-			"autopatchcn.yuanshen.com",
-			"autopatchcn.juequling.com",
-			"prod-cn-alicdn-gamestarter.kurogame.com",
-			"pcdownload-aliyun.aki-game.com",
-			"pcdownload-huoshan.aki-game.com",
-			"pcdownload-qcloud.aki-game.com",
-		},
-		Family:   "6",
-		Trace:    &traceDisabled,
-		UseCache: &useCacheDisabled,
+type fileGame struct {
+	ID                string              `json:"id,omitempty"`
+	Key               string              `json:"key,omitempty"`
+	Name              string              `json:"name"`
+	Enabled           *bool               `json:"enabled,omitempty"`
+	Domains           []string            `json:"domains,omitempty"`
+	Aliases           map[string][]string `json:"aliases,omitempty"`
+	Groups            []fileGameGroup     `json:"groups,omitempty"`
+	PreferredProvider string              `json:"preferred_provider,omitempty"`
+}
+
+type fileGameGroup struct {
+	Name    string           `json:"name"`
+	Mode    string           `json:"mode,omitempty"`
+	Domains []fileGameDomain `json:"domains"`
+}
+
+type fileGameDomain struct {
+	Host     string   `json:"host"`
+	Provider string   `json:"provider,omitempty"`
+	Aliases  []string `json:"aliases,omitempty"`
+}
+
+type fileGeoIPConfig struct {
+	PrimaryProvider  string `json:"primary_provider"`
+	FallbackProvider string `json:"fallback_provider"`
+	IPInfoToken      string `json:"ipinfo_token"`
+	CacheFile        string `json:"cache_file"`
+	MMDBCityPath     string `json:"mmdb_city_path"`
+	MMDBASNPath      string `json:"mmdb_asn_path"`
+}
+
+func (cfg *fileConfig) UnmarshalJSON(data []byte) error {
+	type rawFileConfig struct {
+		Domains    []string        `json:"domains"`
+		Games      json.RawMessage `json:"games"`
+		Resolvers  []string        `json:"resolvers"`
+		Family     string          `json:"family"`
+		GeoIP      fileGeoIPConfig `json:"geoip"`
+		Trace      *bool           `json:"trace"`
+		UseCache   *bool           `json:"use_cache"`
+		TunnelPort int             `json:"tunnel_port"`
+	}
+
+	var raw rawFileConfig
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	cfg.LegacyDomains = append([]string(nil), raw.Domains...)
+	cfg.Resolvers = append([]string(nil), raw.Resolvers...)
+	cfg.Family = raw.Family
+	cfg.GeoIP = raw.GeoIP
+	cfg.TunnelPort = raw.TunnelPort
+	_ = raw.Trace
+	_ = raw.UseCache
+
+	switch trimmed := bytes.TrimSpace(raw.Games); {
+	case len(trimmed) == 0, bytes.Equal(trimmed, []byte("null")):
+		return nil
+	case len(trimmed) > 0 && trimmed[0] == '[':
+		return json.Unmarshal(trimmed, &cfg.Games)
+	default:
+		return json.Unmarshal(trimmed, &cfg.LegacyGameSelection)
 	}
 }
 
-func loadFileConfig(path string, required bool) (fileConfig, bool, bool, error) {
+func defaultFileConfig() fileConfig {
+	return fileConfig{
+		Games:      defaultFileGames(),
+		Resolvers:  effectiveResolverValues(nil),
+		Family:     "6",
+		GeoIP:      defaultFileGeoIPConfig(),
+		TunnelPort: 0,
+	}
+}
+
+func loadFileConfig(path string) (fileConfig, bool, bool, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return fileConfig{}, false, false, nil
@@ -60,6 +119,13 @@ func loadFileConfig(path string, required bool) (fileConfig, bool, bool, error) 
 	var cfg fileConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return fileConfig{}, false, false, fmt.Errorf("parse config %s: %w", cleanPath, err)
+	}
+	normalizedResolvers := effectiveResolverValues(cfg.Resolvers)
+	if !sameStringSlice(normalizedResolvers, cfg.Resolvers) {
+		cfg.Resolvers = normalizedResolvers
+		if err := writeFileConfig(cleanPath, cfg); err != nil {
+			return fileConfig{}, false, false, err
+		}
 	}
 	return cfg, true, false, nil
 }
@@ -84,12 +150,15 @@ func writeFileConfig(path string, cfg fileConfig) error {
 	return nil
 }
 
-func applyFileConfig(cfg *config, fileCfg fileConfig, allowDomains bool) error {
-	if !cfg.GamesWasSet && strings.TrimSpace(cfg.GamesSelection) == "" && strings.TrimSpace(fileCfg.Games) != "" {
-		cfg.GamesSelection = strings.TrimSpace(fileCfg.Games)
+func applyFileConfig(cfg *config, fileCfg fileConfig) error {
+	cfg.GameCatalog = gameCatalogFromFileConfig(fileCfg)
+	resolvers, err := resolverSpecsFromValues(effectiveResolverValues(fileCfg.Resolvers))
+	if err != nil {
+		return fmt.Errorf("config resolvers: %w", err)
 	}
+	cfg.ResolverSpecs = resolvers
 
-	if !cfg.FamilyWasSet && strings.TrimSpace(fileCfg.Family) != "" {
+	if strings.TrimSpace(fileCfg.Family) != "" {
 		family, err := parseFamily(fileCfg.Family)
 		if err != nil {
 			return fmt.Errorf("config family: %w", err)
@@ -97,25 +166,124 @@ func applyFileConfig(cfg *config, fileCfg fileConfig, allowDomains bool) error {
 		cfg.Family = family
 	}
 
-	if !cfg.TraceWasSet && fileCfg.Trace != nil {
-		cfg.TraceEnabled = *fileCfg.Trace
-	}
+	cfg.GeoIP = geoIPConfigFromFile(fileCfg.GeoIP)
 
-	if !cfg.UseCacheWasSet && fileCfg.UseCache != nil {
-		cfg.UseCache = *fileCfg.UseCache
-	}
-
-	if !cfg.HostsOutWasSet && strings.TrimSpace(fileCfg.HostsOut) != "" {
-		cfg.HostsOut = strings.TrimSpace(fileCfg.HostsOut)
-	}
-
-	if allowDomains && len(fileCfg.Domains) > 0 {
-		domains, err := loadDomains("", fileCfg.Domains)
-		if err != nil {
-			return fmt.Errorf("config domains: %w", err)
-		}
-		cfg.ConfigDomains = domains
+	if fileCfg.TunnelPort >= 0 {
+		cfg.TunnelPort = fileCfg.TunnelPort
 	}
 
 	return nil
+}
+
+func effectiveResolverValues(values []string) []string {
+	configured := dedupeResolverValues(values)
+	localResolvers := discoverLocalResolverValues()
+	if len(localResolvers) > 0 {
+		configured = stripSystemResolverValues(configured)
+	}
+	if len(configured) == 0 {
+		configured = resolverValuesFromSpecs(defaultResolverSpecs)
+	}
+
+	merged := append(localResolvers, configured...)
+	return dedupeResolverValues(merged)
+}
+
+func resolverValuesFromSpecs(specs []resolverSpec) []string {
+	values := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		server := strings.TrimSpace(spec.Server)
+		if server == "" {
+			server = strings.TrimSpace(spec.Label)
+		}
+		if server == "" {
+			continue
+		}
+		values = append(values, server)
+	}
+	return values
+}
+
+func sameStringSlice(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func stripSystemResolverValues(values []string) []string {
+	filtered := values[:0]
+	for _, value := range values {
+		if isSystemResolverValue(value) {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
+}
+
+func resolverSpecsFromValues(values []string) ([]resolverSpec, error) {
+	seen := make(map[string]struct{})
+	var specs []resolverSpec
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		server, err := normalizeDNSAddress(value)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[server]; ok {
+			continue
+		}
+		seen[server] = struct{}{}
+		specs = append(specs, resolverSpec{
+			Label:  value,
+			Server: value,
+		})
+	}
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("no valid DNS resolvers configured")
+	}
+	return specs, nil
+}
+
+func defaultFileGeoIPConfig() fileGeoIPConfig {
+	return fileGeoIPConfig{
+		PrimaryProvider:  string(geoIPProviderIPWhoIS),
+		FallbackProvider: string(geoIPProviderIPInfoLite),
+		CacheFile:        defaultGeoIPCacheFile,
+		MMDBCityPath:     "",
+		MMDBASNPath:      "",
+	}
+}
+
+func geoIPConfigFromFile(fileCfg fileGeoIPConfig) geoIPConfig {
+	cfg := defaultGeoIPConfig()
+
+	if provider := normalizeGeoIPProvider(fileCfg.PrimaryProvider); provider != "" {
+		cfg.PrimaryProvider = string(provider)
+	}
+	if provider := normalizeGeoIPProvider(fileCfg.FallbackProvider); provider != "" {
+		cfg.FallbackProvider = string(provider)
+	}
+	if strings.EqualFold(strings.TrimSpace(fileCfg.FallbackProvider), "none") {
+		cfg.FallbackProvider = ""
+	}
+	if token := strings.TrimSpace(fileCfg.IPInfoToken); token != "" {
+		cfg.IPInfoToken = token
+	}
+	if cacheFile := strings.TrimSpace(fileCfg.CacheFile); cacheFile != "" {
+		cfg.CacheFile = cacheFile
+	}
+	cfg.MMDBCityPath = strings.TrimSpace(fileCfg.MMDBCityPath)
+	cfg.MMDBASNPath = strings.TrimSpace(fileCfg.MMDBASNPath)
+
+	return cfg
 }

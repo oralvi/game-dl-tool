@@ -14,10 +14,6 @@ type runLogger struct {
 	hook func(string)
 }
 
-func newRunLogger(path string) (*runLogger, error) {
-	return newRunLoggerWithHook(path, nil)
-}
-
 func newRunLoggerWithHook(path string, hook func(string)) (*runLogger, error) {
 	path = filepath.Clean(path)
 	if path == "" || path == "." {

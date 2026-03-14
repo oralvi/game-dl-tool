@@ -38,17 +38,21 @@ func writeCache(path string, rows []resultRow) error {
 	return nil
 }
 
-func readCache(path string) ([]resultRow, error) {
-	data, err := os.ReadFile(filepath.Clean(path))
+func readCacheIfPresent(path string) ([]resultRow, bool, error) {
+	cleanPath := filepath.Clean(path)
+	data, err := os.ReadFile(cleanPath)
 	if err != nil {
-		return nil, fmt.Errorf("read cache %s: %w", path, err)
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read cache %s: %w", cleanPath, err)
 	}
 
 	var payload cachedScan
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return nil, fmt.Errorf("parse cache %s: %w", path, err)
+		return nil, true, fmt.Errorf("parse cache %s: %w", cleanPath, err)
 	}
-	return payload.Rows, nil
+	return payload.Rows, true, nil
 }
 
 func filterCachedRows(rows []resultRow, domains []string, family ipFamily) []resultRow {
@@ -68,12 +72,4 @@ func filterCachedRows(rows []resultRow, domains []string, family ipFamily) []res
 		filtered = append(filtered, row)
 	}
 	return filtered
-}
-
-func fileExists(path string) bool {
-	if path == "" {
-		return false
-	}
-	_, err := os.Stat(path)
-	return err == nil
 }

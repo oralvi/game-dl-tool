@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -22,7 +21,6 @@ type progressSnapshot struct {
 }
 
 type progressTracker struct {
-	terminal bool
 	total    int
 	started  time.Time
 	stopCh   chan struct{}
@@ -34,12 +32,10 @@ type progressTracker struct {
 	activeDomains map[string]time.Time
 	lastCompleted string
 	spinnerIndex  int
-	lastLineWidth int
 }
 
-func newProgressTracker(total int, terminal bool, onUpdate func(progressSnapshot)) *progressTracker {
+func newProgressTracker(total int, _ bool, onUpdate func(progressSnapshot)) *progressTracker {
 	tracker := &progressTracker{
-		terminal:      terminal && total > 0,
 		total:         total,
 		started:       time.Now(),
 		activeDomains: make(map[string]time.Time),
@@ -66,7 +62,6 @@ func (p *progressTracker) loop() {
 			p.render()
 		case <-p.stopCh:
 			p.renderFinal()
-			fmt.Fprintln(os.Stdout)
 			close(p.doneCh)
 			return
 		}
@@ -156,26 +151,15 @@ func (p *progressTracker) buildLineLocked(final bool) string {
 	return line
 }
 
-func (p *progressTracker) writeLine(line string) {
-	padding := ""
-	if p.lastLineWidth > len(line) {
-		padding = strings.Repeat(" ", p.lastLineWidth-len(line))
-	}
-	fmt.Fprintf(os.Stdout, "\r%s%s", line, padding)
-	p.lastLineWidth = len(line)
-}
-
 func (p *progressTracker) enabled() bool {
-	return p.total > 0 && (p.terminal || p.onUpdate != nil)
+	return p.total > 0 && p.onUpdate != nil
 }
 
 func (p *progressTracker) publish(line string, snapshot progressSnapshot) {
 	if p.onUpdate != nil {
 		p.onUpdate(snapshot)
 	}
-	if p.terminal {
-		p.writeLine(line)
-	}
+	_ = line
 }
 
 func (p *progressTracker) snapshotLocked(final bool) progressSnapshot {
@@ -256,12 +240,4 @@ func formatElapsed(d time.Duration) string {
 	minutes := seconds / 60
 	seconds = seconds % 60
 	return fmt.Sprintf("%02d:%02d", minutes, seconds)
-}
-
-func isTerminalFile(file *os.File) bool {
-	info, err := file.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
 }

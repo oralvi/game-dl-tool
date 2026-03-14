@@ -1,22 +1,42 @@
-# Build outputs
+﻿# Build output
 *.exe
 *.zip
+*.syso
 bin/
 releases/
-fyne_metadata.json
-*.syso
+build/bin/
 
-# Runtime/generated files
+# Frontend generated files
+frontend/node_modules/
+frontend/dist/
+frontend/wailsjs/
+frontend/package.json.md5
+
+# Local runtime data
 cache/
 results/
 targets/
 research/
 config.json
 scan_cache.json
+geoip_cache.json
+latest_scan.log
 
-# OS/editor noise
-Thumbs.db
-.DS_Store
-.vscode/
+# Backups and logs
 *.bak
 *.log
+
+# Temp or local scaffolding
+_wails_seed/
+tmp-icons/
+
+# Local icon assets
+build/appicon.png
+build/windows/icon.ico
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+tools/
+

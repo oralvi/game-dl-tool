@@ -1,0 +1,34 @@
+html,
+body,
+#root,
+#app {
+  min-height: 100%;
+}
+
+html {
+  background: #f6f1e8;
+}
+
+body {
+  margin: 0;
+  font-family: "Nunito", "Segoe UI", "Helvetica Neue", sans-serif;
+  color: #1f2828;
+}
+
+@font-face {
+  font-family: "Nunito";
+  font-style: normal;
+  font-weight: 400;
+  src: local(""),
+    url("assets/fonts/nunito-v16-latin-regular.woff2") format("woff2");
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}

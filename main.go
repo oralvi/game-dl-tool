@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/csv"
 	"errors"
-	"flag"
 	"fmt"
 	"net"
 	"net/url"
@@ -17,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"text/tabwriter"
 	"time"
 
 	"github.com/miekg/dns"
@@ -25,12 +23,18 @@ import (
 
 var hopLinePattern = regexp.MustCompile(`^\s*(\d+)\s+`)
 
+const systemResolverToken = "system"
+
 var defaultResolverSpecs = []resolverSpec{
 	{Label: "223.5.5.5", Server: "223.5.5.5"},
+	{Label: "223.6.6.6", Server: "223.6.6.6"},
 	{Label: "119.29.29.29", Server: "119.29.29.29"},
 	{Label: "180.76.76.76", Server: "180.76.76.76"},
+	{Label: "114.114.114.114", Server: "114.114.114.114"},
+	{Label: "114.114.115.115", Server: "114.114.115.115"},
 	{Label: "1.1.1.1", Server: "1.1.1.1"},
 	{Label: "8.8.8.8", Server: "8.8.8.8"},
+	{Label: "9.9.9.9", Server: "9.9.9.9"},
 }
 
 type ipFamily string
@@ -51,14 +55,22 @@ type resolverClient struct {
 	Resolver *net.Resolver
 }
 
+type geoIPConfig struct {
+	PrimaryProvider  string
+	FallbackProvider string
+	IPInfoToken      string
+	CacheFile        string
+	MMDBCityPath     string
+	MMDBASNPath      string
+}
+
 type config struct {
 	ResolverSpecs  []resolverSpec
 	ConfigPath     string
-	ConfigDomains  []string
+	GameCatalog    []gameTarget
 	Family         ipFamily
-	HostsOut       string
-	GamesSelection string
-	UseCache       bool
+	GeoIP          geoIPConfig
+	TunnelPort     int
 	CacheFile      string
 	LogFile        string
 	Port           int
@@ -66,7 +78,6 @@ type config struct {
 	RoundGap       time.Duration
 	ResolveTimeout time.Duration
 	ConnectTimeout time.Duration
-	TraceEnabled   bool
 	TraceMaxHops   int
 	TraceWait      time.Duration
 	TraceTimeout   time.Duration
@@ -74,15 +85,6 @@ type config struct {
 	ShowProgress   bool
 	Logger         *runLogger
 	ProgressSink   func(progressSnapshot)
-	Interactive    bool
-	ManualInput    bool
-	GamesWasSet    bool
-	FamilyWasSet   bool
-	TraceWasSet    bool
-	UseCacheWasSet bool
-	HostsOutWasSet bool
-	ConfigWasSet   bool
-	ConfigCreated  bool
 }
 
 type discoveryEntry struct {
@@ -95,10 +97,23 @@ type discoveryEntry struct {
 }
 
 type traceResult struct {
-	HopCount int
-	Reached  bool
-	Status   string
-	Note     string
+	HopCount  int
+	Reached   bool
+	Status    string
+	Note      string
+	Hops      []traceHop
+	RawOutput string
+}
+
+type traceHop struct {
+	Hop       int    `json:"hop"`
+	IPAddress string `json:"ipAddress"`
+	Hostname  string `json:"hostname"`
+	Geo       string `json:"geo"`
+	Network   string `json:"network"`
+	RTT       string `json:"rtt"`
+	Status    string `json:"status"`
+	RawLine   string `json:"rawLine"`
 }
 
 type resultRow struct {
@@ -120,305 +135,6 @@ type resultRow struct {
 type probeBatch struct {
 	Domain string
 	Rows   []resultRow
-}
-
-func runCLI() {
-	cfg, inputFile, csvFile, cliDomains := parseFlags()
-	reader := bufio.NewReader(os.Stdin)
-	logger, err := newRunLogger(cfg.LogFile)
-	if err != nil {
-		exitWithError(err.Error())
-	}
-	defer logger.Close()
-	cfg.Logger = logger
-	cfg.Logger.Printf("session started")
-	if cfg.ConfigCreated {
-		fmt.Printf("Initialized default config at %s\n", cfg.ConfigPath)
-		cfg.Logger.Printf("initialized default config at %s", cfg.ConfigPath)
-	}
-
-	domains, aliases, err := resolveDomainsAndAliases(&cfg, inputFile, cliDomains, reader)
-	if err != nil {
-		exitWithError(err.Error())
-	}
-	if len(domains) == 0 {
-		exitWithError("no valid domains found")
-	}
-
-	fmt.Println("Selected domains:")
-	for _, domain := range domains {
-		fmt.Println(" ", domain)
-	}
-	cfg.Logger.Printf("selected domains: %s", strings.Join(domains, ", "))
-
-	fmt.Printf(
-		"\nStarting scan for %d domains with %d resolvers. Trace: %t. Log: %s\n",
-		len(domains),
-		len(cfg.ResolverSpecs),
-		cfg.TraceEnabled,
-		cfg.LogFile,
-	)
-
-	rows, usedCache, err := executeScan(cfg, domains)
-	if err != nil {
-		exitWithError(err.Error())
-	}
-	if usedCache {
-		fmt.Printf("\nUsing cached results from %s\n", cfg.CacheFile)
-	} else {
-		fmt.Printf("\nCache saved to %s\n", cfg.CacheFile)
-	}
-
-	printTable(rows)
-	printBestByDomain(rows)
-
-	rowsForHosts := bestRowsByDomainAndFamily(rows)
-	if cfg.HostsOut == "" && cfg.Interactive && !cfg.HostsOutWasSet && !cfg.ManualInput && !cfg.GamesWasSet {
-		selectedRows, writeHosts, err := promptHostRows(reader, rows)
-		if err != nil {
-			exitWithError(err.Error())
-		}
-		if writeHosts {
-			cfg.HostsOut = "system"
-			rowsForHosts = selectedRows
-		}
-	}
-
-	if cfg.HostsOut != "" {
-		writtenPath, err := upsertHostsFile(cfg.HostsOut, rowsForHosts, aliases)
-		if err != nil {
-			exitWithError(err.Error())
-		}
-		fmt.Printf("\nHosts written to %s\n", writtenPath)
-		cfg.Logger.Printf("hosts written to %s", writtenPath)
-	}
-
-	if csvFile != "" {
-		if err := writeCSV(csvFile, rows); err != nil {
-			exitWithError(err.Error())
-		}
-		fmt.Printf("\nCSV written to %s\n", csvFile)
-		cfg.Logger.Printf("csv written to %s", csvFile)
-	}
-}
-
-func parseFlags() (config, string, string, []string) {
-	var (
-		configPath     = flag.String("config", "config.json", "Optional JSON config file for domains and default scan options")
-		inputFile      = flag.String("input", "", "Path to a file containing domains, one per line")
-		csvFile        = flag.String("csv", "", "Optional CSV output path")
-		dnsList        = flag.String("dns", "", "Comma-separated DNS resolvers. Use 'system' to include the OS resolver")
-		gamesFlag      = flag.String("games", "", "Game selection like 12, 135, or all")
-		familyFlag     = flag.String("family", string(family6), "IP family to scan: 4, 6, or all")
-		hostsOut       = flag.String("hosts-out", "", "Write best results into a hosts file. Use 'system' for the OS hosts file")
-		useCache       = flag.Bool("use-cache", false, "Use cached results instead of running a live scan")
-		cacheFile      = flag.String("cache-file", defaultCacheFile, "Cache file path used for saving and loading scan results")
-		logFile        = flag.String("log-file", "cache/latest_scan.log", "Log file path for scan progress and run details; use empty string to disable")
-		port           = flag.Int("port", 443, "TCP port used for latency probing; set 0 to skip")
-		rounds         = flag.Int("rounds", 3, "How many DNS sampling rounds to run per resolver")
-		roundGap       = flag.Duration("round-gap", 300*time.Millisecond, "Pause between DNS rounds for the same resolver")
-		resolveTimeout = flag.Duration("resolve-timeout", 5*time.Second, "Timeout for each AAAA lookup")
-		connectTimeout = flag.Duration("connect-timeout", 3*time.Second, "Timeout for each TCP latency probe")
-		traceEnabled   = flag.Bool("trace", false, "Run traceroute/tracert hop estimation")
-		traceMaxHops   = flag.Int("trace-max-hops", 16, "Maximum hop count used by traceroute")
-		traceWait      = flag.Duration("trace-wait", 400*time.Millisecond, "Per-hop wait budget used by traceroute")
-		traceTimeout   = flag.Duration("trace-timeout", 20*time.Second, "Overall timeout for traceroute")
-		workers        = flag.Int("workers", 4, "Number of concurrent domains to probe")
-		progress       = flag.Bool("progress", true, "Show a live progress bar while scanning when stdout is a terminal")
-	)
-
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags] [domain1 domain2 ...]\n\n", os.Args[0])
-		fmt.Fprintln(flag.CommandLine.Output(), "Games:")
-		for _, game := range knownGames {
-			fmt.Fprintf(flag.CommandLine.Output(), "  %s. %s\n", game.ID, game.Name)
-		}
-		fmt.Fprintln(flag.CommandLine.Output())
-		fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s\n", os.Args[0])
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s -games 12 -family all\n", os.Args[0])
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s -games 5 -family 6 -csv wuwa.csv\n", os.Args[0])
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s -family all -hosts-out system\n\n", os.Args[0])
-		fmt.Fprintln(flag.CommandLine.Output(), "Default resolvers when -dns is omitted:")
-		for _, spec := range defaultResolverSpecs {
-			if spec.Server == "" {
-				fmt.Fprintf(flag.CommandLine.Output(), "  %s\n", spec.Label)
-				continue
-			}
-			fmt.Fprintf(flag.CommandLine.Output(), "  %s\n", spec.Server)
-		}
-		fmt.Fprintln(flag.CommandLine.Output())
-		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
-		flag.PrintDefaults()
-	}
-
-	flag.Parse()
-	setFlags := make(map[string]bool)
-	flag.Visit(func(f *flag.Flag) {
-		setFlags[f.Name] = true
-	})
-
-	if *workers < 1 {
-		exitWithError("-workers must be at least 1")
-	}
-	if *rounds < 1 {
-		exitWithError("-rounds must be at least 1")
-	}
-	if *traceMaxHops < 1 {
-		exitWithError("-trace-max-hops must be at least 1")
-	}
-	if *port < 0 {
-		exitWithError("-port cannot be negative")
-	}
-	if *roundGap < 0 {
-		exitWithError("-round-gap cannot be negative")
-	}
-	if *resolveTimeout <= 0 || *connectTimeout <= 0 || *traceWait <= 0 || *traceTimeout <= 0 {
-		exitWithError("all timeout values must be positive")
-	}
-
-	resolverSpecs, err := parseResolverSpecs(*dnsList)
-	if err != nil {
-		exitWithError(err.Error())
-	}
-
-	family, err := parseFamily(*familyFlag)
-	if err != nil {
-		exitWithError(err.Error())
-	}
-
-	cfg := config{
-		ResolverSpecs:  resolverSpecs,
-		ConfigPath:     strings.TrimSpace(*configPath),
-		Family:         family,
-		HostsOut:       strings.TrimSpace(*hostsOut),
-		GamesSelection: strings.TrimSpace(*gamesFlag),
-		UseCache:       *useCache,
-		CacheFile:      strings.TrimSpace(*cacheFile),
-		LogFile:        strings.TrimSpace(*logFile),
-		Port:           *port,
-		Rounds:         *rounds,
-		RoundGap:       *roundGap,
-		ResolveTimeout: *resolveTimeout,
-		ConnectTimeout: *connectTimeout,
-		TraceEnabled:   *traceEnabled,
-		TraceMaxHops:   *traceMaxHops,
-		TraceWait:      *traceWait,
-		TraceTimeout:   *traceTimeout,
-		Workers:        *workers,
-		ShowProgress:   *progress && isTerminalFile(os.Stdout),
-		Interactive:    isInteractiveTerminal(),
-		ManualInput:    strings.TrimSpace(*inputFile) != "" || len(flag.Args()) > 0,
-		GamesWasSet:    setFlags["games"],
-		FamilyWasSet:   setFlags["family"],
-		TraceWasSet:    setFlags["trace"],
-		UseCacheWasSet: setFlags["use-cache"],
-		HostsOutWasSet: setFlags["hosts-out"],
-		ConfigWasSet:   setFlags["config"],
-	}
-	if cfg.CacheFile == "" {
-		cfg.CacheFile = defaultCacheFile
-	}
-
-	fileCfg, foundConfig, createdConfig, err := loadFileConfig(cfg.ConfigPath, cfg.ConfigWasSet)
-	if err != nil {
-		exitWithError(err.Error())
-	}
-	cfg.ConfigCreated = createdConfig
-	if foundConfig {
-		allowDomains := strings.TrimSpace(*inputFile) == "" && len(flag.Args()) == 0
-		if err := applyFileConfig(&cfg, fileCfg, allowDomains); err != nil {
-			exitWithError(err.Error())
-		}
-	}
-
-	return cfg, *inputFile, *csvFile, flag.Args()
-}
-
-func exitWithError(message string) {
-	fmt.Fprintln(os.Stderr, "Error:", message)
-	os.Exit(1)
-}
-
-func parseResolverSpecs(input string) ([]resolverSpec, error) {
-	if strings.TrimSpace(input) == "" {
-		return append([]resolverSpec(nil), defaultResolverSpecs...), nil
-	}
-
-	seen := make(map[string]struct{})
-	var specs []resolverSpec
-	for _, token := range strings.Split(input, ",") {
-		token = strings.TrimSpace(token)
-		if token == "" {
-			continue
-		}
-
-		if strings.EqualFold(token, "system") {
-			if _, ok := seen["system"]; ok {
-				continue
-			}
-			seen["system"] = struct{}{}
-			specs = append(specs, resolverSpec{Label: "system"})
-			continue
-		}
-
-		server, err := normalizeDNSAddress(token)
-		if err != nil {
-			return nil, fmt.Errorf("invalid -dns value %q: %w", token, err)
-		}
-		if _, ok := seen[server]; ok {
-			continue
-		}
-		seen[server] = struct{}{}
-		specs = append(specs, resolverSpec{
-			Label:  token,
-			Server: server,
-		})
-	}
-
-	if len(specs) == 0 {
-		return nil, errors.New("no usable resolvers found in -dns")
-	}
-	return specs, nil
-}
-
-func loadDomains(inputFile string, cliDomains []string) ([]string, error) {
-	seen := make(map[string]struct{})
-	var domains []string
-
-	appendDomain := func(raw string) {
-		normalized := normalizeDomain(raw)
-		if normalized == "" {
-			return
-		}
-		if _, ok := seen[normalized]; ok {
-			return
-		}
-		seen[normalized] = struct{}{}
-		domains = append(domains, normalized)
-	}
-
-	if inputFile != "" {
-		file, err := os.Open(inputFile)
-		if err != nil {
-			return nil, fmt.Errorf("open %s: %w", inputFile, err)
-		}
-		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			appendDomain(scanner.Text())
-		}
-		if err := scanner.Err(); err != nil {
-			return nil, fmt.Errorf("read %s: %w", inputFile, err)
-		}
-	}
-
-	for _, domain := range cliDomains {
-		appendDomain(domain)
-	}
-
-	return domains, nil
 }
 
 func normalizeDomain(raw string) string {
@@ -452,7 +168,7 @@ func normalizeDomain(raw string) string {
 func newResolverClients(specs []resolverSpec) ([]resolverClient, error) {
 	clients := make([]resolverClient, 0, len(specs))
 	for _, spec := range specs {
-		if spec.Server != "" {
+		if spec.Server != "" && !isSystemResolverValue(spec.Server) {
 			server, err := normalizeDNSAddress(spec.Server)
 			if err != nil {
 				return nil, fmt.Errorf("invalid resolver %q: %w", spec.Label, err)
@@ -473,7 +189,7 @@ func newResolverClients(specs []resolverSpec) ([]resolverClient, error) {
 }
 
 func newResolver(spec resolverSpec) (*net.Resolver, error) {
-	if spec.Server == "" {
+	if spec.Server == "" || isSystemResolverValue(spec.Server) {
 		return net.DefaultResolver, nil
 	}
 
@@ -490,6 +206,9 @@ func normalizeDNSAddress(server string) (string, error) {
 	server = strings.TrimSpace(server)
 	if server == "" {
 		return "", errors.New("empty dns server")
+	}
+	if isSystemResolverValue(server) {
+		return systemResolverToken, nil
 	}
 
 	if _, _, err := net.SplitHostPort(server); err == nil {
@@ -509,6 +228,15 @@ func normalizeDNSAddress(server string) (string, error) {
 	}
 
 	return net.JoinHostPort(server, "53"), nil
+}
+
+func isSystemResolverValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case systemResolverToken, "local", "localdns", "os":
+		return true
+	default:
+		return false
+	}
 }
 
 func run(cfg config, resolvers []resolverClient, domains []string) []resultRow {
@@ -664,14 +392,6 @@ func probeDomain(cfg config, resolvers []resolverClient, domain string) []result
 			if err != nil {
 				row.Note = mergeNotes(row.Note, fmt.Sprintf("tcp:%v", err))
 			}
-		}
-
-		if cfg.TraceEnabled {
-			trace := traceIP(entry.Address, entry.Family, cfg)
-			row.HopCount = trace.HopCount
-			row.TraceReached = trace.Reached
-			row.TraceStatus = trace.Status
-			row.Note = mergeNotes(row.Note, trace.Note)
 		}
 
 		rows = append(rows, row)
@@ -939,28 +659,39 @@ func traceIP(ip string, family ipFamily, cfg config) traceResult {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	output, err := exec.CommandContext(ctx, command, args...).CombinedOutput()
-	hopCount, reached := parseTraceOutput(string(output), ip)
+	cmd := exec.CommandContext(ctx, command, args...)
+	prepareBackgroundCommand(cmd)
+	output, err := cmd.CombinedOutput()
+	rawOutput := strings.TrimSpace(decodeCommandOutput(output))
+	hops := parseTraceHops(rawOutput)
+	hops = enrichTraceHops(cfg, hops)
+	hopCount, reached := summarizeTraceHops(hops, ip)
 	if reached {
 		return traceResult{
-			HopCount: hopCount,
-			Reached:  true,
-			Status:   "ok",
+			HopCount:  hopCount,
+			Reached:   true,
+			Status:    "ok",
+			Hops:      hops,
+			RawOutput: rawOutput,
 		}
 	}
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		if hopCount > 0 {
 			return traceResult{
-				HopCount: hopCount,
-				Reached:  false,
-				Status:   "partial",
-				Note:     "traceroute timed out",
+				HopCount:  hopCount,
+				Reached:   false,
+				Status:    "partial",
+				Note:      "traceroute timed out",
+				Hops:      hops,
+				RawOutput: rawOutput,
 			}
 		}
 		return traceResult{
-			Status: "timeout",
-			Note:   "traceroute timed out",
+			Status:    "timeout",
+			Note:      "traceroute timed out",
+			Hops:      hops,
+			RawOutput: rawOutput,
 		}
 	}
 
@@ -970,23 +701,29 @@ func traceIP(ip string, family ipFamily, cfg config) traceResult {
 			note = err.Error()
 		}
 		return traceResult{
-			HopCount: hopCount,
-			Reached:  false,
-			Status:   "partial",
-			Note:     note,
+			HopCount:  hopCount,
+			Reached:   false,
+			Status:    "partial",
+			Note:      note,
+			Hops:      hops,
+			RawOutput: rawOutput,
 		}
 	}
 
 	if err != nil {
 		return traceResult{
-			Status: "failed",
-			Note:   err.Error(),
+			Status:    "failed",
+			Note:      err.Error(),
+			Hops:      hops,
+			RawOutput: rawOutput,
 		}
 	}
 
 	return traceResult{
-		Status: "no_route",
-		Note:   "no hops detected",
+		Status:    "no_route",
+		Note:      "no hops detected",
+		Hops:      hops,
+		RawOutput: rawOutput,
 	}
 }
 
@@ -1016,10 +753,12 @@ func tracerouteCommand(ip string, family ipFamily, cfg config) (string, []string
 	}
 }
 
-func parseTraceOutput(output string, targetIP string) (int, bool) {
-	maxHop := 0
-	reachedHop := 0
+func parseTraceHops(output string) []traceHop {
+	if strings.TrimSpace(output) == "" {
+		return nil
+	}
 
+	var hops []traceHop
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1032,18 +771,62 @@ func parseTraceOutput(output string, targetIP string) (int, bool) {
 		if err != nil {
 			continue
 		}
-		if hop > maxHop {
-			maxHop = hop
+
+		tail := strings.TrimSpace(line[len(matches[0]):])
+		ip := findLastIPToken(line)
+		rtt := tail
+		status := "ok"
+		if ip != "" {
+			if index := strings.LastIndex(tail, ip); index >= 0 {
+				rtt = strings.TrimSpace(tail[:index])
+			}
+		} else {
+			status = "timeout"
 		}
-		if strings.Contains(line, targetIP) {
-			reachedHop = hop
+		if containsTraceTimeoutText(line) {
+			status = "timeout"
+		}
+		if strings.TrimSpace(rtt) == "" {
+			rtt = "-"
+		}
+
+		hops = append(hops, traceHop{
+			Hop:       hop,
+			IPAddress: ip,
+			RTT:       rtt,
+			Status:    status,
+			RawLine:   strings.TrimSpace(line),
+		})
+	}
+	return hops
+}
+
+func summarizeTraceHops(hops []traceHop, targetIP string) (int, bool) {
+	maxHop := 0
+	reachedHop := 0
+	for _, hop := range hops {
+		if hop.Hop > maxHop {
+			maxHop = hop.Hop
+		}
+		if strings.TrimSpace(targetIP) != "" && hop.IPAddress == strings.TrimSpace(targetIP) {
+			reachedHop = hop.Hop
 		}
 	}
-
 	if reachedHop > 0 {
 		return reachedHop, true
 	}
 	return maxHop, false
+}
+
+func findLastIPToken(line string) string {
+	fields := strings.Fields(line)
+	for index := len(fields) - 1; index >= 0; index-- {
+		token := strings.Trim(fields[index], "[](),")
+		if net.ParseIP(token) != nil {
+			return token
+		}
+	}
+	return ""
 }
 
 func sortRows(rows []resultRow) {
@@ -1071,119 +854,6 @@ func sortRows(rows []resultRow) {
 	})
 }
 
-func printTable(rows []resultRow) {
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "DOMAIN\tFAMILY\tCNAME\tADDRESS\tRESOLVERS\tDNS_MS\tTCP_MS\tTCP_OK\tHOPS\tTRACE\tNOTE")
-	for _, row := range rows {
-		fmt.Fprintf(
-			tw,
-			"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%t\t%s\t%s\t%s\n",
-			row.Domain,
-			valueOrDash(string(row.Family)),
-			valueOrDash(row.CNAME),
-			valueOrDash(row.Address),
-			valueOrDash(row.ResolverList),
-			formatMillis(row.ResolveLatency),
-			formatOptionalMillis(row.ConnectLatency, row.ConnectOK || row.ConnectLatency > 0),
-			row.ConnectOK,
-			formatOptionalInt(row.HopCount),
-			row.TraceStatus,
-			valueOrDash(row.Note),
-		)
-	}
-	_ = tw.Flush()
-}
-
-func printBestByDomain(rows []resultRow) {
-	bestRows := bestRowsByDomainAndFamily(rows)
-	if len(bestRows) == 0 {
-		return
-	}
-
-	fmt.Println()
-
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "BEST_DOMAIN\tFAMILY\tBEST_CNAME\tBEST_ADDRESS\tRESOLVERS\tTCP_MS\tHOPS\tTRACE\tNOTE")
-	for _, row := range bestRows {
-		fmt.Fprintf(
-			tw,
-			"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			row.Domain,
-			valueOrDash(string(row.Family)),
-			valueOrDash(row.CNAME),
-			valueOrDash(row.Address),
-			valueOrDash(row.ResolverList),
-			formatOptionalMillis(row.ConnectLatency, row.ConnectOK || row.ConnectLatency > 0),
-			formatOptionalInt(row.HopCount),
-			row.TraceStatus,
-			valueOrDash(row.Note),
-		)
-	}
-	_ = tw.Flush()
-}
-
-func bestRowsByDomainAndFamily(rows []resultRow) []resultRow {
-	best := make(map[string]resultRow)
-	for _, row := range rows {
-		key := row.Domain + "|" + string(row.Family)
-		current, ok := best[key]
-		if !ok || betterRow(row, current) {
-			best[key] = row
-		}
-	}
-
-	keys := make([]string, 0, len(best))
-	for key := range best {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	result := make([]resultRow, 0, len(keys))
-	for _, key := range keys {
-		result = append(result, best[key])
-	}
-	sortRows(result)
-	return result
-}
-
-func betterRow(left resultRow, right resultRow) bool {
-	leftHasAddress := strings.TrimSpace(left.Address) != ""
-	rightHasAddress := strings.TrimSpace(right.Address) != ""
-	if leftHasAddress != rightHasAddress {
-		return leftHasAddress
-	}
-	if left.ConnectOK != right.ConnectOK {
-		return left.ConnectOK
-	}
-	if left.ConnectLatency != right.ConnectLatency {
-		switch {
-		case left.ConnectLatency == 0:
-			return false
-		case right.ConnectLatency == 0:
-			return true
-		default:
-			return left.ConnectLatency < right.ConnectLatency
-		}
-	}
-	if left.ResolverCount != right.ResolverCount {
-		return left.ResolverCount > right.ResolverCount
-	}
-	if left.TraceReached != right.TraceReached {
-		return left.TraceReached
-	}
-	if left.HopCount != right.HopCount {
-		switch {
-		case left.HopCount == 0:
-			return false
-		case right.HopCount == 0:
-			return true
-		default:
-			return left.HopCount < right.HopCount
-		}
-	}
-	return left.Address < right.Address
-}
-
 func writeCSV(path string, rows []resultRow) error {
 	file, err := os.Create(path)
 	if err != nil {
@@ -1200,7 +870,6 @@ func writeCSV(path string, rows []resultRow) error {
 		"cname",
 		"address",
 		"resolvers",
-		"dns_ms",
 		"tcp_ms",
 		"tcp_ok",
 		"hop_count",
@@ -1219,7 +888,6 @@ func writeCSV(path string, rows []resultRow) error {
 			row.CNAME,
 			row.Address,
 			row.ResolverList,
-			formatMillis(row.ResolveLatency),
 			formatOptionalMillis(row.ConnectLatency, row.ConnectOK || row.ConnectLatency > 0),
 			strconv.FormatBool(row.ConnectOK),
 			formatOptionalInt(row.HopCount),
